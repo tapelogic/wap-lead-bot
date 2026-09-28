@@ -1,0 +1,570 @@
+{
+  "name": "WhatsApp Lead Bot - AI Reply + Human Handoff",
+  "nodes": [
+    {
+      "id": "Webhook_Verify",
+      "name": "Webhook Verify (GET)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "wa-verify",
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "wa-lead-bot",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "Check_Verify_Token",
+      "name": "Check Verify Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const BUSINESS_CONFIG = {\n  businessName: 'Demo Business',\n  language: 'Persian (Farsi) unless the customer writes in another language',\n  services: 'General customer inquiries (replace with the real product/service list for this client)',\n  handoffKeywords: ['شکایت', 'complaint', 'refund', 'مرجوعی', 'لغو', 'cancel', 'قانونی', 'lawyer'],\n};\nconst CONFIDENCE_THRESHOLD = 0.6;\n\n// Set this to the same random string you enter in the Meta App dashboard\n// (WhatsApp > Configuration > Webhook > Verify Token). Move this to an n8n\n// credential/environment variable for anything beyond a demo.\nconst VERIFY_TOKEN = 'REPLACE_WITH_YOUR_VERIFY_TOKEN';\n\nconst q = $input.first().json.query || {};\nconst mode = q['hub.mode'];\nconst token = q['hub.verify_token'];\nconst challenge = q['hub.challenge'];\n\nif (mode === 'subscribe' && token === VERIFY_TOKEN) {\n  return [{ json: { statusCode: 200, body: challenge } }];\n}\nreturn [{ json: { statusCode: 403, body: 'verification failed' } }];"
+      }
+    },
+    {
+      "id": "Respond_Verify",
+      "name": "Respond to Webhook (Verify)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{$json.body}}",
+        "options": {
+          "responseCode": "={{$json.statusCode}}"
+        }
+      }
+    },
+    {
+      "id": "Webhook_Receive",
+      "name": "Webhook Receive (POST)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "wa-receive",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wa-lead-bot",
+        "responseMode": "onReceived",
+        "responseCode": 200,
+        "responseData": "EVENT_RECEIVED",
+        "options": {}
+      }
+    },
+    {
+      "id": "Normalize,_Dedupe,_Route",
+      "name": "Normalize, Dedupe, Route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "/**\n * normalize.js\n * Turns a raw WhatsApp Cloud API webhook POST body into a flat list of\n * normalized \"events\" this workflow can act on.\n *\n * WhatsApp webhook shape (Cloud API, Meta):\n * {\n *   object: \"whatsapp_business_account\",\n *   entry: [{\n *     id: \"<WABA id>\",\n *     changes: [{\n *       field: \"messages\",\n *       value: {\n *         messaging_product: \"whatsapp\",\n *         metadata: { phone_number_id, display_phone_number },\n *         contacts: [{ profile: { name }, wa_id }],\n *         messages: [{ from, id, timestamp, type, text, image, ... }],\n *         statuses: [{ id, status, recipient_id, timestamp }]\n *       }\n *     }]\n *   }]\n * }\n *\n * Known real-world edge cases handled here (not happy-path-only):\n * - `messages` and `statuses` can both be present, or either can be absent.\n * - A single webhook call can carry more than one message (rare but allowed\n *   by the API, e.g. if delivery was delayed and Meta batches).\n * - `statuses` entries (sent/delivered/read/failed) are NOT user messages\n *   and must not be treated as one -- a naive workflow that reacts to any\n *   webhook hit will \"reply\" to its own delivery receipts.\n * - Meta redelivers the same webhook if your endpoint is slow or returns\n *   non-2xx, so the same message `id` can arrive more than once. Dedup is\n *   the caller's job (see dedupe.js) but this module exposes the id needed\n *   to do it.\n * - Non-text message types (image, audio, document, sticker, location,\n *   interactive button/list reply, unknown/unsupported) must not be run\n *   through a text-only AI prompt -- extract what's usable, flag the rest.\n * - `timestamp` is a unix-seconds value encoded as a STRING.\n * - Malformed/partial payloads (missing entry, empty changes, test pings\n *   from the Meta dashboard) must not throw.\n */\n\n/**\n * @param {any} body - raw JSON body of the webhook POST\n * @returns {Array<object>} normalized events, each one of:\n *   { kind: 'message', id, from, timestamp, phoneNumberId, contactName, messageType, text, raw }\n *   { kind: 'status',  id, status, recipientId, timestamp }\n */\nfunction normalizeWebhookBody(body) {\n  const events = [];\n\n  if (!body || typeof body !== 'object') return events;\n  if (body.object !== 'whatsapp_business_account') return events;\n  if (!Array.isArray(body.entry)) return events;\n\n  for (const entry of body.entry) {\n    const changes = Array.isArray(entry && entry.changes) ? entry.changes : [];\n    for (const change of changes) {\n      if (!change || change.field !== 'messages') continue;\n      const value = change.value || {};\n      const phoneNumberId =\n        value.metadata && value.metadata.phone_number_id\n          ? String(value.metadata.phone_number_id)\n          : null;\n\n      const contactsByWaId = {};\n      if (Array.isArray(value.contacts)) {\n        for (const c of value.contacts) {\n          if (c && c.wa_id) {\n            contactsByWaId[c.wa_id] = (c.profile && c.profile.name) || null;\n          }\n        }\n      }\n\n      if (Array.isArray(value.messages)) {\n        for (const msg of value.messages) {\n          if (!msg || !msg.id || !msg.from) continue; // malformed entry, skip\n          events.push(normalizeSingleMessage(msg, phoneNumberId, contactsByWaId));\n        }\n      }\n\n      if (Array.isArray(value.statuses)) {\n        for (const st of value.statuses) {\n          if (!st || !st.id) continue;\n          events.push({\n            kind: 'status',\n            id: String(st.id),\n            status: st.status || 'unknown',\n            recipientId: st.recipient_id || null,\n            timestamp: st.timestamp || null,\n          });\n        }\n      }\n    }\n  }\n\n  return events;\n}\n\nconst SUPPORTED_TEXTLIKE_TYPES = new Set(['text', 'button', 'interactive']);\n\nfunction normalizeSingleMessage(msg, phoneNumberId, contactsByWaId) {\n  const base = {\n    kind: 'message',\n    id: String(msg.id),\n    from: String(msg.from),\n    timestamp: msg.timestamp || null,\n    phoneNumberId,\n    contactName: contactsByWaId[msg.from] || null,\n    messageType: msg.type || 'unknown',\n    text: null,\n    raw: msg,\n  };\n\n  switch (msg.type) {\n    case 'text':\n      base.text = (msg.text && typeof msg.text.body === 'string') ? msg.text.body.trim() : '';\n      break;\n    case 'button':\n      // reply to a template button\n      base.text = (msg.button && msg.button.text) || '';\n      break;\n    case 'interactive': {\n      const it = msg.interactive || {};\n      if (it.type === 'button_reply' && it.button_reply) {\n        base.text = it.button_reply.title || it.button_reply.id || '';\n      } else if (it.type === 'list_reply' && it.list_reply) {\n        base.text = it.list_reply.title || it.list_reply.id || '';\n      } else {\n        base.text = '';\n      }\n      break;\n    }\n    default:\n      // image, audio, video, document, sticker, location, contacts, unknown...\n      base.text = null;\n      break;\n  }\n\n  base.isTextLike = SUPPORTED_TEXTLIKE_TYPES.has(msg.type) && !!base.text;\n  return base;\n}\n\n/**\n * dedupe.js\n * WhatsApp Cloud API redelivers the same webhook when your endpoint is slow\n * or returns a non-2xx status. Without dedup, a slow AI call means the same\n * inbound message gets answered twice (or a human gets paged twice).\n *\n * In n8n this is backed by the workflow's static data\n * ($getWorkflowStaticData('global')), which n8n persists in its own\n * database per workflow. That's fine for a single-instance MVP; it is NOT\n * safe under horizontal scaling (multiple n8n workers) or huge volume,\n * because it round-trips the whole store on every read/write and has no\n * row-level locking. Documented in README as a known scaling limit.\n *\n * seenIds is a plain object map { [messageId]: timestampMs } so it is\n * JSON-serializable (a requirement for n8n static data).\n */\n\nconst DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24h: WhatsApp message ids don't repeat after that in practice\n\n/**\n * @param {Record<string, number>} seenIds - mutated in place\n * @param {string} messageId\n * @param {number} nowMs\n * @param {number} ttlMs\n * @returns {boolean} true if this is a NEW message (caller should process it)\n */\nfunction markAndCheck(seenIds, messageId, nowMs = Date.now(), ttlMs = DEFAULT_TTL_MS) {\n  if (!messageId) return true; // nothing to dedup against; let it through\n\n  // opportunistic cleanup so the object doesn't grow forever\n  for (const id of Object.keys(seenIds)) {\n    if (nowMs - seenIds[id] > ttlMs) delete seenIds[id];\n  }\n\n  if (Object.prototype.hasOwnProperty.call(seenIds, messageId)) {\n    return false; // already processed -> duplicate delivery\n  }\n  seenIds[messageId] = nowMs;\n  return true;\n}\n\n/**\n * router.js\n * Final decision layer: given the normalized event, the dedup result, the\n * session state and (if we got that far) the AI result, decide exactly one\n * action. This is kept separate from ai-agent.js so the \"when do we shut up\n * and hand off to a human\" policy is in one auditable place.\n *\n * Session shape (persisted externally -- see README for storage options):\n * {\n *   waId: string,\n *   state: 'bot' | 'human',       // 'human' = a person took over; bot stays silent\n *   history: [{ role: 'user'|'bot', text: string, ts: number }],\n *   lead: { name: string|null, intent: string|null },\n *   nonTextStreak: number,        // consecutive non-text messages with no usable text\n *   updatedAt: number\n * }\n */\n\nconst MAX_HISTORY_TURNS = 12; // keep prompts bounded; older context summarized by not being there\nconst NON_TEXT_HANDOFF_STREAK = 2; // 2 media-only messages in a row -> let a human look\n\nfunction newSession(waId, now = Date.now()) {\n  return {\n    waId,\n    state: 'bot',\n    history: [],\n    lead: { name: null, intent: null },\n    nonTextStreak: 0,\n    updatedAt: now,\n  };\n}\n\nfunction pushHistory(session, role, text, now = Date.now()) {\n  session.history.push({ role, text, ts: now });\n  if (session.history.length > MAX_HISTORY_TURNS) {\n    session.history = session.history.slice(-MAX_HISTORY_TURNS);\n  }\n  session.updatedAt = now;\n}\n\n/**\n * @param {object} event - normalized event from normalize.js (kind: 'message')\n * @param {object} session - session object (will be mutated)\n * @param {object|null} aiResult - result of ai-agent.parseAiResponse, or null\n *   if we haven't called the AI yet (e.g. non-text message, or already\n *   in human mode)\n * @returns {{ action: 'reply'|'handoff'|'ignore', replyText: string|null, reason: string }}\n */\nfunction decide(event, session, aiResult) {\n  if (session.state === 'human') {\n    // A person already took this conversation over. The bot stays silent\n    // until the human (via the CRM/sheet) flips the session back to 'bot'.\n    // This is a deliberate product decision, not an oversight: an AI reply\n    // arriving *after* a human already answered is confusing and looks\n    // unprofessional to the customer.\n    return { action: 'ignore', replyText: null, reason: 'session_owned_by_human' };\n  }\n\n  if (!event.isTextLike) {\n    session.nonTextStreak = (session.nonTextStreak || 0) + 1;\n    if (session.nonTextStreak >= NON_TEXT_HANDOFF_STREAK) {\n      return {\n        action: 'handoff',\n        replyText: 'پیام شما دریافت شد؛ همکار ما به‌زودی به صورت شخصی پاسخ می‌دهد.',\n        reason: 'repeated_non_text',\n      };\n    }\n    return {\n      action: 'reply',\n      replyText: 'لطفاً درخواستتان را به صورت پیام متنی هم برایمان بنویسید تا بتوانیم دقیق پاسخ بدهیم 🙏',\n      reason: 'non_text_message',\n    };\n  }\n\n  session.nonTextStreak = 0;\n\n  if (!aiResult) {\n    // Should not happen if the caller wired things correctly, but never\n    // send nothing and never crash -- fail toward a human.\n    return { action: 'handoff', replyText: null, reason: 'missing_ai_result' };\n  }\n\n  if (aiResult.parseError) {\n    return { action: 'handoff', replyText: null, reason: 'ai_response_unparseable' };\n  }\n\n  if (aiResult.handoff) {\n    return {\n      action: 'handoff',\n      replyText: aiResult.reply || null, // if the model still produced a polite reply, send it before escalating\n      reason: aiResult.confidence < 0.6 ? 'low_confidence' : 'model_requested_handoff',\n    };\n  }\n\n  return { action: 'reply', replyText: aiResult.reply, reason: 'ai_answered' };\n}\n\n/**\n * ai-agent.js\n * Builds the prompt sent to the LLM and defensively parses its response.\n *\n * The model is instructed to return ONLY a JSON object. In practice LLMs\n * sometimes:\n *  - wrap JSON in ```json fences\n *  - add a sentence before/after the JSON\n *  - return invalid JSON (trailing comma, single quotes, truncated on\n *    length cutoff)\n *  - omit fields\n * None of those may crash the workflow or silently produce an empty reply\n * that gets sent to a real customer -- they must force a human handoff.\n */\n\nconst DEFAULT_CONFIDENCE_THRESHOLD = 0.6;\n\nfunction buildSystemPrompt(businessConfig) {\n  const { businessName, language, services, handoffKeywords } = businessConfig;\n  return [\n    `You are the first-line WhatsApp assistant for \"${businessName}\".`,\n    `Reply in ${language || 'the language the customer wrote in'}.`,\n    services ? `What this business offers: ${services}` : null,\n    'Your job: answer simple questions, collect the lead\\'s name and what they need, and know when you are out of your depth.',\n    'Escalate to a human (set \"handoff\": true) whenever: the customer asks for a price/quote you are not certain of, asks something you cannot answer confidently, sounds angry or upset, explicitly asks for a human, or asks something unrelated to the business.',\n    handoffKeywords && handoffKeywords.length\n      ? `Always escalate immediately if the message contains any of these words: ${handoffKeywords.join(', ')}.`\n      : null,\n    'Respond with ONLY a single JSON object, no prose outside it, matching exactly this shape:',\n    '{\"reply\": string, \"confidence\": number between 0 and 1, \"handoff\": boolean, \"lead\": {\"name\": string|null, \"intent\": string|null}}',\n    '\"confidence\" is YOUR OWN estimate of how correct/safe \"reply\" is. Be honest and conservative: if unsure, use a low number and set handoff true.',\n  ]\n    .filter(Boolean)\n    .join('\\n');\n}\n\nfunction buildMessages(businessConfig, history, incomingText) {\n  const messages = [{ role: 'system', content: buildSystemPrompt(businessConfig) }];\n  for (const turn of history || []) {\n    messages.push({ role: turn.role === 'bot' ? 'assistant' : 'user', content: turn.text });\n  }\n  messages.push({ role: 'user', content: incomingText });\n  return messages;\n}\n\n/**\n * Extracts a JSON object from a raw LLM text response, tolerating common\n * wrapping mistakes (code fences, leading/trailing prose).\n */\nfunction extractJsonObject(rawText) {\n  if (typeof rawText !== 'string') return null;\n  let s = rawText.trim();\n\n  const fenced = s.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n  if (fenced) s = fenced[1].trim();\n\n  const first = s.indexOf('{');\n  const last = s.lastIndexOf('}');\n  if (first === -1 || last === -1 || last < first) return null;\n  s = s.slice(first, last + 1);\n\n  try {\n    return JSON.parse(s);\n  } catch (e) {\n    return null;\n  }\n}\n\n/**\n * @param {string} rawText - raw content string from the LLM API response\n * @param {number} confidenceThreshold\n * @returns {{ ok: boolean, reply: string|null, confidence: number, handoff: boolean,\n *             lead: {name: string|null, intent: string|null}, parseError: boolean }}\n */\nfunction parseAiResponse(rawText, confidenceThreshold = DEFAULT_CONFIDENCE_THRESHOLD) {\n  const parsed = extractJsonObject(rawText);\n\n  if (!parsed || typeof parsed !== 'object') {\n    return {\n      ok: false,\n      reply: null,\n      confidence: 0,\n      handoff: true,\n      lead: { name: null, intent: null },\n      parseError: true,\n    };\n  }\n\n  const reply = typeof parsed.reply === 'string' && parsed.reply.trim() ? parsed.reply.trim() : null;\n  let confidence = typeof parsed.confidence === 'number' && isFinite(parsed.confidence) ? parsed.confidence : 0;\n  confidence = Math.max(0, Math.min(1, confidence));\n  const modelHandoff = parsed.handoff === true;\n  const lead = {\n    name: parsed.lead && typeof parsed.lead.name === 'string' ? parsed.lead.name.trim() || null : null,\n    intent: parsed.lead && typeof parsed.lead.intent === 'string' ? parsed.lead.intent.trim() || null : null,\n  };\n\n  const missingReply = !reply;\n  const lowConfidence = confidence < confidenceThreshold;\n  const handoff = modelHandoff || missingReply || lowConfidence;\n\n  return {\n    ok: true,\n    reply,\n    confidence,\n    handoff,\n    lead,\n    parseError: false,\n  };\n}\n\nconst BUSINESS_CONFIG = {\n  businessName: 'Demo Business',\n  language: 'Persian (Farsi) unless the customer writes in another language',\n  services: 'General customer inquiries (replace with the real product/service list for this client)',\n  handoffKeywords: ['شکایت', 'complaint', 'refund', 'مرجوعی', 'لغو', 'cancel', 'قانونی', 'lawyer'],\n};\nconst CONFIDENCE_THRESHOLD = 0.6;\n\nconst staticData = $getWorkflowStaticData('global');\nstaticData.seenIds = staticData.seenIds || {};\nstaticData.sessions = staticData.sessions || {};\n\nconst body = $input.first().json.body || $input.first().json;\nconst events = normalizeWebhookBody(body);\nconst outputItems = [];\n\nfor (const event of events) {\n  if (event.kind === 'status') continue; // delivery/read receipt, not a message\n\n  const isNew = markAndCheck(staticData.seenIds, event.id);\n  if (!isNew) continue; // Meta redelivered a message we already handled\n\n  let session = staticData.sessions[event.from];\n  if (!session) {\n    session = newSession(event.from);\n    staticData.sessions[event.from] = session;\n  }\n  if (event.isTextLike) pushHistory(session, 'user', event.text);\n\n  const needsAI = event.isTextLike && session.state === 'bot';\n\n  if (needsAI) {\n    const historyForPrompt = session.history.slice(0, -1); // exclude the message we're about to send as the final user turn\n    const messages = buildMessages(BUSINESS_CONFIG, historyForPrompt, event.text);\n    outputItems.push({\n      json: {\n        waId: event.from,\n        phoneNumberId: event.phoneNumberId,\n        contactName: event.contactName,\n        needsAI: true,\n        messages,\n        event,\n      },\n    });\n  } else {\n    const decision = decide(event, session, null);\n    if (decision.action === 'handoff') session.state = 'human';\n    if (decision.action === 'reply' && decision.replyText) pushHistory(session, 'bot', decision.replyText);\n    outputItems.push({\n      json: {\n        waId: event.from,\n        phoneNumberId: event.phoneNumberId,\n        contactName: event.contactName,\n        needsAI: false,\n        decision,\n        event,\n      },\n    });\n  }\n}\n\nreturn outputItems;"
+      }
+    },
+    {
+      "id": "Needs_AI?",
+      "name": "Needs AI?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{$json.needsAI}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "Call_AI",
+      "name": "Call AI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.AI_API_URL || \"https://api.openai.com/v1/chat/completions\"}}",
+        "authentication": "none",
+        "sendHeaders": true,
+        "sendBody": true,
+        "options": {},
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.AI_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"model\": $env.AI_MODEL || \"gpt-4o-mini\", \"messages\": $json.messages, \"temperature\": 0.3 } }}"
+      }
+    },
+    {
+      "id": "Parse_AI,_Decide,_Persist",
+      "name": "Parse AI, Decide, Persist",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "/**\n * ai-agent.js\n * Builds the prompt sent to the LLM and defensively parses its response.\n *\n * The model is instructed to return ONLY a JSON object. In practice LLMs\n * sometimes:\n *  - wrap JSON in ```json fences\n *  - add a sentence before/after the JSON\n *  - return invalid JSON (trailing comma, single quotes, truncated on\n *    length cutoff)\n *  - omit fields\n * None of those may crash the workflow or silently produce an empty reply\n * that gets sent to a real customer -- they must force a human handoff.\n */\n\nconst DEFAULT_CONFIDENCE_THRESHOLD = 0.6;\n\nfunction buildSystemPrompt(businessConfig) {\n  const { businessName, language, services, handoffKeywords } = businessConfig;\n  return [\n    `You are the first-line WhatsApp assistant for \"${businessName}\".`,\n    `Reply in ${language || 'the language the customer wrote in'}.`,\n    services ? `What this business offers: ${services}` : null,\n    'Your job: answer simple questions, collect the lead\\'s name and what they need, and know when you are out of your depth.',\n    'Escalate to a human (set \"handoff\": true) whenever: the customer asks for a price/quote you are not certain of, asks something you cannot answer confidently, sounds angry or upset, explicitly asks for a human, or asks something unrelated to the business.',\n    handoffKeywords && handoffKeywords.length\n      ? `Always escalate immediately if the message contains any of these words: ${handoffKeywords.join(', ')}.`\n      : null,\n    'Respond with ONLY a single JSON object, no prose outside it, matching exactly this shape:',\n    '{\"reply\": string, \"confidence\": number between 0 and 1, \"handoff\": boolean, \"lead\": {\"name\": string|null, \"intent\": string|null}}',\n    '\"confidence\" is YOUR OWN estimate of how correct/safe \"reply\" is. Be honest and conservative: if unsure, use a low number and set handoff true.',\n  ]\n    .filter(Boolean)\n    .join('\\n');\n}\n\nfunction buildMessages(businessConfig, history, incomingText) {\n  const messages = [{ role: 'system', content: buildSystemPrompt(businessConfig) }];\n  for (const turn of history || []) {\n    messages.push({ role: turn.role === 'bot' ? 'assistant' : 'user', content: turn.text });\n  }\n  messages.push({ role: 'user', content: incomingText });\n  return messages;\n}\n\n/**\n * Extracts a JSON object from a raw LLM text response, tolerating common\n * wrapping mistakes (code fences, leading/trailing prose).\n */\nfunction extractJsonObject(rawText) {\n  if (typeof rawText !== 'string') return null;\n  let s = rawText.trim();\n\n  const fenced = s.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n  if (fenced) s = fenced[1].trim();\n\n  const first = s.indexOf('{');\n  const last = s.lastIndexOf('}');\n  if (first === -1 || last === -1 || last < first) return null;\n  s = s.slice(first, last + 1);\n\n  try {\n    return JSON.parse(s);\n  } catch (e) {\n    return null;\n  }\n}\n\n/**\n * @param {string} rawText - raw content string from the LLM API response\n * @param {number} confidenceThreshold\n * @returns {{ ok: boolean, reply: string|null, confidence: number, handoff: boolean,\n *             lead: {name: string|null, intent: string|null}, parseError: boolean }}\n */\nfunction parseAiResponse(rawText, confidenceThreshold = DEFAULT_CONFIDENCE_THRESHOLD) {\n  const parsed = extractJsonObject(rawText);\n\n  if (!parsed || typeof parsed !== 'object') {\n    return {\n      ok: false,\n      reply: null,\n      confidence: 0,\n      handoff: true,\n      lead: { name: null, intent: null },\n      parseError: true,\n    };\n  }\n\n  const reply = typeof parsed.reply === 'string' && parsed.reply.trim() ? parsed.reply.trim() : null;\n  let confidence = typeof parsed.confidence === 'number' && isFinite(parsed.confidence) ? parsed.confidence : 0;\n  confidence = Math.max(0, Math.min(1, confidence));\n  const modelHandoff = parsed.handoff === true;\n  const lead = {\n    name: parsed.lead && typeof parsed.lead.name === 'string' ? parsed.lead.name.trim() || null : null,\n    intent: parsed.lead && typeof parsed.lead.intent === 'string' ? parsed.lead.intent.trim() || null : null,\n  };\n\n  const missingReply = !reply;\n  const lowConfidence = confidence < confidenceThreshold;\n  const handoff = modelHandoff || missingReply || lowConfidence;\n\n  return {\n    ok: true,\n    reply,\n    confidence,\n    handoff,\n    lead,\n    parseError: false,\n  };\n}\n\n/**\n * router.js\n * Final decision layer: given the normalized event, the dedup result, the\n * session state and (if we got that far) the AI result, decide exactly one\n * action. This is kept separate from ai-agent.js so the \"when do we shut up\n * and hand off to a human\" policy is in one auditable place.\n *\n * Session shape (persisted externally -- see README for storage options):\n * {\n *   waId: string,\n *   state: 'bot' | 'human',       // 'human' = a person took over; bot stays silent\n *   history: [{ role: 'user'|'bot', text: string, ts: number }],\n *   lead: { name: string|null, intent: string|null },\n *   nonTextStreak: number,        // consecutive non-text messages with no usable text\n *   updatedAt: number\n * }\n */\n\nconst MAX_HISTORY_TURNS = 12; // keep prompts bounded; older context summarized by not being there\nconst NON_TEXT_HANDOFF_STREAK = 2; // 2 media-only messages in a row -> let a human look\n\nfunction newSession(waId, now = Date.now()) {\n  return {\n    waId,\n    state: 'bot',\n    history: [],\n    lead: { name: null, intent: null },\n    nonTextStreak: 0,\n    updatedAt: now,\n  };\n}\n\nfunction pushHistory(session, role, text, now = Date.now()) {\n  session.history.push({ role, text, ts: now });\n  if (session.history.length > MAX_HISTORY_TURNS) {\n    session.history = session.history.slice(-MAX_HISTORY_TURNS);\n  }\n  session.updatedAt = now;\n}\n\n/**\n * @param {object} event - normalized event from normalize.js (kind: 'message')\n * @param {object} session - session object (will be mutated)\n * @param {object|null} aiResult - result of ai-agent.parseAiResponse, or null\n *   if we haven't called the AI yet (e.g. non-text message, or already\n *   in human mode)\n * @returns {{ action: 'reply'|'handoff'|'ignore', replyText: string|null, reason: string }}\n */\nfunction decide(event, session, aiResult) {\n  if (session.state === 'human') {\n    // A person already took this conversation over. The bot stays silent\n    // until the human (via the CRM/sheet) flips the session back to 'bot'.\n    // This is a deliberate product decision, not an oversight: an AI reply\n    // arriving *after* a human already answered is confusing and looks\n    // unprofessional to the customer.\n    return { action: 'ignore', replyText: null, reason: 'session_owned_by_human' };\n  }\n\n  if (!event.isTextLike) {\n    session.nonTextStreak = (session.nonTextStreak || 0) + 1;\n    if (session.nonTextStreak >= NON_TEXT_HANDOFF_STREAK) {\n      return {\n        action: 'handoff',\n        replyText: 'پیام شما دریافت شد؛ همکار ما به‌زودی به صورت شخصی پاسخ می‌دهد.',\n        reason: 'repeated_non_text',\n      };\n    }\n    return {\n      action: 'reply',\n      replyText: 'لطفاً درخواستتان را به صورت پیام متنی هم برایمان بنویسید تا بتوانیم دقیق پاسخ بدهیم 🙏',\n      reason: 'non_text_message',\n    };\n  }\n\n  session.nonTextStreak = 0;\n\n  if (!aiResult) {\n    // Should not happen if the caller wired things correctly, but never\n    // send nothing and never crash -- fail toward a human.\n    return { action: 'handoff', replyText: null, reason: 'missing_ai_result' };\n  }\n\n  if (aiResult.parseError) {\n    return { action: 'handoff', replyText: null, reason: 'ai_response_unparseable' };\n  }\n\n  if (aiResult.handoff) {\n    return {\n      action: 'handoff',\n      replyText: aiResult.reply || null, // if the model still produced a polite reply, send it before escalating\n      reason: aiResult.confidence < 0.6 ? 'low_confidence' : 'model_requested_handoff',\n    };\n  }\n\n  return { action: 'reply', replyText: aiResult.reply, reason: 'ai_answered' };\n}\n\nconst CONFIDENCE_THRESHOLD = 0.6;\n\nconst staticData = $getWorkflowStaticData('global');\nconst prior = $('Normalize, Dedupe, Route').item.json;\nconst aiResponse = $json;\n\nconst rawText =\n  aiResponse && aiResponse.choices && aiResponse.choices[0] && aiResponse.choices[0].message\n    ? aiResponse.choices[0].message.content\n    : null;\n\nconst aiResult = parseAiResponse(rawText, CONFIDENCE_THRESHOLD);\nconst session = staticData.sessions[prior.waId];\n\nconst decision = decide(prior.event, session, aiResult);\n\nif (decision.action === 'handoff') {\n  session.state = 'human';\n}\nif (decision.replyText) {\n  pushHistory(session, 'bot', decision.replyText);\n}\n\nreturn {\n  json: {\n    waId: prior.waId,\n    phoneNumberId: prior.phoneNumberId,\n    contactName: prior.contactName,\n    decision,\n    aiResult,\n  },\n};"
+      }
+    },
+    {
+      "id": "Action_=_reply?",
+      "name": "Action = reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{$json.decision.action}}",
+              "rightValue": "reply",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "Action_=_handoff?",
+      "name": "Action = handoff?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        500
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{$json.decision.action}}",
+              "rightValue": "handoff",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "Send_WhatsApp_Reply",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1420,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{\"https://graph.facebook.com/v20.0/\" + $json.phoneNumberId + \"/messages\"}}",
+        "authentication": "none",
+        "sendHeaders": true,
+        "sendBody": true,
+        "options": {},
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.WHATSAPP_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"messaging_product\": \"whatsapp\", \"to\": $json.waId, \"type\": \"text\", \"text\": { \"body\": $json.decision.replyText } } }}"
+      }
+    },
+    {
+      "id": "Handoff_has_interim_text?",
+      "name": "Handoff has interim text?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        500
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{$json.decision.replyText}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEqual"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "Send_WhatsApp_Interim_Reply",
+      "name": "Send WhatsApp Interim Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1660,
+        440
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{\"https://graph.facebook.com/v20.0/\" + $json.phoneNumberId + \"/messages\"}}",
+        "authentication": "none",
+        "sendHeaders": true,
+        "sendBody": true,
+        "options": {},
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.WHATSAPP_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"messaging_product\": \"whatsapp\", \"to\": $json.waId, \"type\": \"text\", \"text\": { \"body\": $json.decision.replyText } } }}"
+      }
+    },
+    {
+      "id": "Notify_Human_(Handoff)",
+      "name": "Notify Human (Handoff)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1900,
+        500
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.HUMAN_NOTIFY_WEBHOOK_URL}}",
+        "authentication": "none",
+        "sendHeaders": false,
+        "sendBody": true,
+        "options": {},
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"text\": \"🔔 تحویل به انسان: \" + ($json.contactName || $json.waId) + \" (\" + $json.waId + \") — دلیل: \" + $json.decision.reason } }}"
+      }
+    },
+    {
+      "id": "Log_to_CRM",
+      "name": "Log to CRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2140,
+        350
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.CRM_LOG_WEBHOOK_URL}}",
+        "authentication": "none",
+        "sendHeaders": false,
+        "sendBody": true,
+        "options": {},
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"waId\": $json.waId, \"contactName\": $json.contactName, \"action\": ($json.decision ? $json.decision.action : \"unknown\"), \"reason\": ($json.decision ? $json.decision.reason : null), \"replyText\": ($json.decision ? $json.decision.replyText : null), \"timestamp\": new Date().toISOString() } }}"
+      }
+    },
+    {
+      "id": "NoOp_placeholder",
+      "name": "End",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2380,
+        350
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Webhook Verify (GET)": {
+      "main": [
+        [
+          {
+            "node": "Check Verify Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Verify Token": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook (Verify)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Receive (POST)": {
+      "main": [
+        [
+          {
+            "node": "Normalize, Dedupe, Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize, Dedupe, Route": {
+      "main": [
+        [
+          {
+            "node": "Needs AI?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs AI?": {
+      "main": [
+        [
+          {
+            "node": "Call AI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Action = reply?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Action = handoff?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call AI": {
+      "main": [
+        [
+          {
+            "node": "Parse AI, Decide, Persist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI, Decide, Persist": {
+      "main": [
+        [
+          {
+            "node": "Action = reply?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Action = handoff?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Action = reply?": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Action = handoff?": {
+      "main": [
+        [
+          {
+            "node": "Handoff has interim text?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log to CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handoff has interim text?": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Interim Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Human (Handoff)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Interim Reply": {
+      "main": [
+        [
+          {
+            "node": "Notify Human (Handoff)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Reply": {
+      "main": [
+        [
+          {
+            "node": "Log to CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Human (Handoff)": {
+      "main": [
+        [
+          {
+            "node": "Log to CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to CRM": {
+      "main": [
+        [
+          {
+            "node": "End",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
